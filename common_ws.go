@@ -2,7 +2,6 @@ package mypolymarketapi
 
 import (
 	"errors"
-	"fmt"
 	"net/http"
 	"net/url"
 	"strings"
@@ -96,6 +95,13 @@ type WsStreamClient struct {
 	isClose         bool
 	waitSubResult   bool
 	waitSubResultMu *sync.Mutex
+
+	// dataHandler 由子类型（如 MarketWsStreamClient）注入，每条非 PONG 原始消息都会调用它。
+	// 若为 nil，则消息被静默丢弃。
+	dataHandler func(data []byte)
+	// reconnectHook 在每次自动重连成功后由 handleResult goroutine 调用。
+	// 若为 nil，则走 reSubscribeForReconnect 的遗留逻辑（User/Sports 兼容）。
+	reconnectHook func()
 }
 
 // Subscription 表示通用 WS 订阅对象（由具体频道自行分发消息到 resultChan）。
@@ -124,9 +130,7 @@ func (sub *Subscription) CloseChan() chan struct{} {
 	return sub.closeChan
 }
 
-type MarketWsStreamClient struct {
-	WsStreamClient
-}
+// MarketWsStreamClient 定义在 ws_market.go（完整广播-订阅实现）。
 
 type UserWsStreamClient struct {
 	WsStreamClient
@@ -134,26 +138,6 @@ type UserWsStreamClient struct {
 
 type SportsWsStreamClient struct {
 	WsStreamClient
-}
-
-func (*MyPolymarket) NewMarketWsStreamClient() *MarketWsStreamClient {
-	return &MarketWsStreamClient{
-		WsStreamClient: WsStreamClient{
-			isInit:          false,
-			client:          &Client{},
-			channel:         WS_MARKET,
-			writeMu:         &sync.Mutex{},
-			isClose:         true,
-			waitSubResult:   false,
-			waitSubResultMu: &sync.Mutex{},
-			reSubscribeMu:   &sync.Mutex{},
-
-			commonSubMap: NewMySyncMap[string, *Subscription](),
-
-			resultChan: make(chan []byte),
-			errChan:    make(chan error),
-		},
-	}
 }
 
 func (*MyPolymarket) NewUserWsStreamClient(client *Client) *UserWsStreamClient {
@@ -483,34 +467,8 @@ func getWsAPI(channelType WsChannelType) string {
 	}
 }
 
-func (ws *WsStreamClient) catchSubscribeResult(sub *Subscription) error {
-	if ws == nil || sub == nil {
-		return errors.New("subscription is nil")
-	}
-
-	// 设置总超时时间（建议 10-15s）
-	timeout := time.NewTimer(10 * time.Second)
-	defer timeout.Stop()
-
-	for {
-		select {
-		case data := <-sub.ResultChan():
-			book, ok := data.(WsMarketOrderBook)
-			if !ok {
-				continue
-			}
-			if book.EventType == "book" {
-				sub.resultChan <- book
-				return nil
-			}
-
-		case <-timeout.C:
-			return fmt.Errorf("subscribe timeout: no book event received for SubId %d", sub.SubId)
-		}
-	}
-}
-
-
+// reSubscribeForReconnect 仅供 User/Sports 等仍使用 commonSubMap 的客户端兼容使用。
+// MarketWsStreamClient 通过 reconnectHook 处理重连，不走此路径。
 func (ws *WsStreamClient) reSubscribeForReconnect() error {
 	ws.reSubscribeMu.Lock()
 	defer ws.reSubscribeMu.Unlock()
@@ -522,23 +480,13 @@ func (ws *WsStreamClient) reSubscribeForReconnect() error {
 		if _, ok := isDoReSubscribe[sub.SubId]; ok {
 			return true
 		}
-
 		reSub, err := subscribe(ws, sub.Args)
 		if err != nil {
 			log.Error(err)
 			wErr = err
 			return false
 		}
-
-		err = ws.catchSubscribeResult(sub)
-		if err != nil {
-			log.Error(err)
-			wErr = err
-			return false
-		}
-
 		sub.SubId = reSub.SubId
-
 		log.Infof("reSubscribe Success: args:%v", reSub.Args)
 		isDoReSubscribe[sub.SubId] = true
 		time.Sleep(500 * time.Millisecond)
@@ -582,11 +530,15 @@ func (ws *WsStreamClient) handleResult(resultChan chan []byte, errChan chan erro
 						return
 					}
 					ws.AutoReConnectTimes++
-					go func() {
-						if reSubErr := ws.reSubscribeForReconnect(); reSubErr != nil {
-							log.Error("reSubscribe error: ", reSubErr)
-						}
-					}()
+					if ws.reconnectHook != nil {
+						go ws.reconnectHook()
+					} else {
+						go func() {
+							if reSubErr := ws.reSubscribeForReconnect(); reSubErr != nil {
+								log.Error("reSubscribe error: ", reSubErr)
+							}
+						}()
+					}
 				} else {
 					continue
 				}
@@ -598,63 +550,10 @@ func (ws *WsStreamClient) handleResult(resultChan chan []byte, errChan chan erro
 				if strings.EqualFold(string(data), "PONG") {
 					continue
 				}
-
-				log.Debug("msg: ", string(data))
-
-				if strings.Contains(string(data), "\"event_type\":\"book\"") {
-					orderbooks := handleWsMarketOrderBook(data)
-					for _, ob := range orderbooks {
-						sub, ok := ws.commonSubMap.Load(ob.AssetID)
-						if ok && sub != nil {
-							sub.resultChan <- ob
-						}
-					}
-					continue
+				// log.Debug("msg: ", string(data))
+				if ws.dataHandler != nil {
+					ws.dataHandler(data)
 				}
-
-				if strings.Contains(string(data), "\"event_type\":\"price_change\"") {
-					priceChanges := handleWsMarketPriceChange(data)
-					for _, pc := range priceChanges {
-						sub, ok := ws.commonSubMap.Load(pc.AssetID)
-						if ok && sub != nil {
-							sub.resultChan <- pc
-						}
-					}
-					continue
-				}
-
-				if strings.Contains(string(data), "\"event_type\":\"last_trade_price\"") {
-					lastTradePrice := handleWsMarketLastTradePrice(data)
-					if lastTradePrice != nil {
-						sub, ok := ws.commonSubMap.Load(lastTradePrice.AssetID)
-						if ok && sub != nil {
-							sub.resultChan <- *lastTradePrice
-						}
-					}
-					continue
-				}
-
-				if strings.Contains(string(data), "\"event_type\":\"tick_size_change\"") {
-					tickSizeChange := handleWsMarketTickSizeChange(data)
-					if tickSizeChange != nil {
-						sub, ok := ws.commonSubMap.Load(tickSizeChange.AssetID)
-						if ok && sub != nil {
-							sub.resultChan <- *tickSizeChange
-						}
-					}
-					continue
-				}
-				if strings.Contains(string(data), "\"event_type\":\"best_bid_ask\"") {
-					bestBidAsk := handleWsMarketBestBidAsk(data)
-					if bestBidAsk != nil {
-						sub, ok := ws.commonSubMap.Load(bestBidAsk.AssetID)
-						if ok && sub != nil {
-							sub.resultChan <- *bestBidAsk
-						}
-					}
-					continue
-				}
-				// new_market / market_resolved 可在后续按文档补齐分发（目前未使用）
 			}
 		}
 	}()

@@ -177,3 +177,21 @@ type WsMarketMarketResolved struct {
 	Timestamp      string   `json:"timestamp"`
 	Tags           []string `json:"tags,omitempty"`
 }
+
+func handleWsMarketNewMarket(data []byte) *WsMarketNewMarket {
+	var nm WsMarketNewMarket
+	if err := json.Unmarshal(data, &nm); err != nil {
+		log.Error("unmarshal newMarket error: ", err)
+		return nil
+	}
+	return &nm
+}
+
+func handleWsMarketMarketResolved(data []byte) *WsMarketMarketResolved {
+	var mr WsMarketMarketResolved
+	if err := json.Unmarshal(data, &mr); err != nil {
+		log.Error("unmarshal marketResolved error: ", err)
+		return nil
+	}
+	return &mr
+}
