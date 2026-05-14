@@ -25,6 +25,13 @@ const (
 	UNSUBSCRIBE = "unsubscribe"
 )
 
+// WebSocket 单帧最大读字节数（gorilla/websocket SetReadLimit）。
+// market 频道在大量 assets_ids 订阅时会收到超大 initial_dump / book 数组，默认 640KB 易触发 read limit exceeded。
+const (
+	wsReadLimitDefault = 655350          // ~640KB，user / sports 沿用原行为
+	wsReadLimitMarket  = 64 * 1024 * 1024 // 64MB，容纳大批量 orderbook 快照
+)
+
 var (
 	WebsocketTimeout   = 10 * time.Second
 	WebsocketKeepalive = true
@@ -385,7 +392,12 @@ func wsStreamServe(api string, channel WsChannelType, resultChan chan []byte, er
 	if err != nil {
 		return nil, err
 	}
-	c.SetReadLimit(655350)
+	switch channel {
+	case WS_MARKET:
+		c.SetReadLimit(wsReadLimitMarket)
+	default:
+		c.SetReadLimit(wsReadLimitDefault)
+	}
 	// market/user 要求客户端主动发 PING；sports 由服务端发 ping，客户端只需回 pong。
 	if WebsocketKeepalive && (channel == WS_MARKET || channel == WS_USER) {
 		go keepAlive(c, WebsocketTimeout, writeMu)
